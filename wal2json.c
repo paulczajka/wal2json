@@ -50,7 +50,9 @@ typedef struct
 	 * LSN pointing to the end of commit record + 1 (txn->end_lsn)
 	 * It is useful for tools that wants a position to restart from.
 	 */
-	bool		include_lsn;		/* include LSNs */
+	bool		include_lsn;		/* include end LSNs */
+
+	bool		include_change_lsn;	/* include per-change LSNs */
 
 	uint64		nr_changes;			/* # of passes in pg_decode_change() */
 									/* FIXME replace with txn->nentries */
@@ -138,6 +140,7 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 	data->pretty_print = false;
 	data->write_in_chunks = false;
 	data->include_lsn = false;
+	data->include_change_lsn = false;
 	data->include_not_null = false;
 	data->filter_tables = NIL;
 
@@ -297,6 +300,19 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 				data->include_lsn = true;
 			}
 			else if (!parse_bool(strVal(elem->arg), &data->include_lsn))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+							 strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-change-lsn") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(LOG, "include-change-lsn argument is null");
+				data->include_change_lsn = true;
+			}
+			else if (!parse_bool(strVal(elem->arg), &data->include_change_lsn))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -899,6 +915,13 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		appendStringInfoChar(ctx->out, ',');
 
 	appendStringInfo(ctx->out, "{%s", data->nl);
+
+	/* Print Change LSN */
+	if (data->include_change_lsn) {
+		char *change_lsn = DatumGetCString(DirectFunctionCall1(pg_lsn_out, change->lsn));
+		appendStringInfo(ctx->out, "%s%s%s\"change_lsn\":%s\"%s\",%s", data->ht, data->ht, data->ht, data->sp, change_lsn, data->nl);
+		pfree(change_lsn);
+	}
 
 	/* Print change kind */
 	switch (change->action)
