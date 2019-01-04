@@ -58,6 +58,7 @@ typedef struct
 	bool		include_lsn;		/* include end LSNs */
 
 	bool		include_change_lsn;	/* include per-change LSNs */
+	bool		include_change_number;	/* incrementing change counter */
 
 	uint64		nr_changes;			/* # of passes in pg_decode_change() */
 									/* FIXME replace with txn->nentries */
@@ -148,6 +149,7 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 	data->object_per_chunk = false;
 	data->include_lsn = false;
 	data->include_change_lsn = false;
+	data->include_change_number = false;
 	data->include_not_null = false;
 	data->filter_tables = NIL;
 
@@ -333,6 +335,19 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 				data->include_change_lsn = true;
 			}
 			else if (!parse_bool(strVal(elem->arg), &data->include_change_lsn))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+							 strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-change-number") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(LOG, "include-change-number argument is null");
+				data->include_change_number = true;
+			}
+			else if (!parse_bool(strVal(elem->arg), &data->include_change_number))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -943,6 +958,9 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		appendStringInfo(ctx->out, "%s%s%s\"change_lsn\":%s\"%s\",%s", data->ht, data->ht, data->ht, data->sp, change_lsn, data->nl);
 		pfree(change_lsn);
 	}
+
+	if (data->include_change_number)
+		appendStringInfo(ctx->out, "%s%s%s\"change_number\":%s\"%lu\",%s", data->ht, data->ht, data->ht, data->sp, data->nr_changes, data->nl);
 
 	/* Print metadata on each change when writing an object per chunks */
 	if (data->object_per_chunk)
