@@ -42,6 +42,11 @@ typedef struct
 
 	bool		pretty_print;		/* pretty-print JSON? */
 	bool		write_in_chunks;	/* write in chunks? */
+	/*
+	 * When writing in chunks, write each chunk as a valid json object.
+	 * This setting is ignored when not writing in chunks.
+	 */
+	bool		object_per_chunk;	/* write chunks as valid json objects */
 
 	List		*filter_tables;		/* filter out tables */
 	List		*add_tables;		/* add only these tables */
@@ -88,6 +93,7 @@ static void pg_decode_message(LogicalDecodingContext *ctx,
 
 static bool parse_table_identifier(List *qualified_tables, char separator, List **select_tables);
 static bool string_to_SelectTable(char *rawstring, char separator, List **select_tables);
+static void append_transaction_metadata(LogicalDecodingContext *ctx, ReorderBufferTXN *txn);
 
 void
 _PG_init(void)
@@ -137,6 +143,7 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 	data->include_typmod = true;
 	data->pretty_print = false;
 	data->write_in_chunks = false;
+	data->object_per_chunk = false;
 	data->include_lsn = false;
 	data->include_not_null = false;
 	data->filter_tables = NIL;
@@ -289,6 +296,19 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
 							 strVal(elem->arg), elem->defname)));
 		}
+		else if (strcmp(elem->defname, "object-per-chunk") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(DEBUG1, "object-per-chunk argument is null");
+				data->object_per_chunk = true;
+			}
+			else if (!parse_bool(strVal(elem->arg), &data->object_per_chunk))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+							 strVal(elem->arg), elem->defname)));
+		}
 		else if (strcmp(elem->defname, "include-lsn") == 0)
 		{
 			if (elem->arg == NULL)
@@ -368,6 +388,12 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 						elem->arg ? strVal(elem->arg) : "(null)")));
 		}
 	}
+
+	if (data->object_per_chunk && !data->write_in_chunks)
+	{
+		elog(WARNING, "object-per-chunk has no effect when write-in-chunks=false. Ignoring.");
+		data->object_per_chunk = false;
+	}
 }
 
 /* cleanup this plugin's resources */
@@ -388,25 +414,16 @@ pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 
 	data->nr_changes = 0;
 
+	/* Nothing to do here if writing chunks as objects */
+	if (data->object_per_chunk)
+		return;
+
 	/* Transaction starts */
 	OutputPluginPrepareWrite(ctx, true);
 
 	appendStringInfo(ctx->out, "{%s", data->nl);
 
-	if (data->include_xids)
-		appendStringInfo(ctx->out, "%s\"xid\":%s%u,%s", data->ht, data->sp, txn->xid, data->nl);
-
-	if (data->include_lsn)
-	{
-		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, txn->end_lsn));
-
-		appendStringInfo(ctx->out, "%s\"nextlsn\":%s\"%s\",%s", data->ht, data->sp, lsn_str, data->nl);
-
-		pfree(lsn_str);
-	}
-
-	if (data->include_timestamp)
-		appendStringInfo(ctx->out, "%s\"timestamp\":%s\"%s\",%s", data->ht, data->sp, timestamptz_to_str(txn->commit_time), data->nl);
+	append_transaction_metadata(ctx, txn);
 
 	appendStringInfo(ctx->out, "%s\"change\":%s[", data->ht, data->sp);
 
@@ -420,6 +437,10 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					 XLogRecPtr commit_lsn)
 {
 	JsonDecodingData *data = ctx->output_plugin_private;
+
+	/* Nothing to do here if writing objects per chunk */
+	if (data->object_per_chunk)
+		return;
 
 	if (txn->has_catalog_changes)
 		elog(DEBUG2, "txn has catalog changes: yes");
@@ -895,10 +916,14 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	appendStringInfo(ctx->out, "%s%s", data->ht, data->ht);
 
-	if (data->nr_changes > 1)
+	if (!data->object_per_chunk && data->nr_changes > 1)
 		appendStringInfoChar(ctx->out, ',');
 
 	appendStringInfo(ctx->out, "{%s", data->nl);
+
+	/* Print metadata on each change when writing an object per chunks */
+	if (data->object_per_chunk)
+		append_transaction_metadata(ctx, txn);
 
 	/* Print change kind */
 	switch (change->action)
@@ -1034,16 +1059,25 @@ pg_decode_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	if (!data->write_in_chunks && transactional)
 			appendStringInfo(ctx->out, "%s", data->nl);
 
-	/* build a complete JSON object for non-transactional message */
-	if (!transactional)
-		appendStringInfo(ctx->out, "{%s%s\"change\":%s[%s", data->nl, data->ht, data->sp, data->nl);
+	if (!data->object_per_chunk)
+	{
+		/* build a complete JSON object for non-transactional message */
+		if (!transactional)
+			appendStringInfo(ctx->out, "{%s%s\"change\":%s[%s", data->nl, data->ht, data->sp, data->nl);
 
-	appendStringInfo(ctx->out, "%s%s", data->ht, data->ht);
+		appendStringInfo(ctx->out, "%s%s", data->ht, data->ht);
 
-	if (data->nr_changes > 1)
-		appendStringInfoChar(ctx->out, ',');
+		if (data->nr_changes > 1)
+			appendStringInfoChar(ctx->out, ',');
+	}
 
-	appendStringInfo(ctx->out, "{%s%s%s%s\"kind\":%s\"message\",%s", data->nl, data->ht, data->ht, data->ht, data->sp, data->nl);
+	appendStringInfo(ctx->out, "{%s%s%s", data->nl, data->ht, data->ht);
+
+	/* only transactional messages have transaction metadata, and only when written object per chunk */
+	if(transactional && data->object_per_chunk)
+		append_transaction_metadata(ctx, txn);
+
+	appendStringInfo(ctx->out, "%s\"kind\":%s\"message\",%s", data->ht, data->sp, data->nl);
 
 	if (transactional)
 		appendStringInfo(ctx->out, "%s%s%s\"transactional\":%strue,%s", data->ht, data->ht, data->ht, data->sp, data->nl);
@@ -1062,7 +1096,7 @@ pg_decode_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	appendStringInfo(ctx->out, "%s%s%s}", data->nl, data->ht, data->ht);
 
 	/* build a complete JSON object for non-transactional message */
-	if (!transactional)
+	if (!transactional && !data->object_per_chunk)
 		appendStringInfo(ctx->out, "%s%s]%s}", data->nl, data->ht, data->nl);
 
 	MemoryContextSwitchTo(old);
@@ -1217,4 +1251,23 @@ string_to_SelectTable(char *rawstring, char separator, List **select_tables)
 	list_free_deep(qualified_tables);
 
 	return true;
+}
+
+static void
+append_transaction_metadata(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
+{
+	JsonDecodingData *data = ctx->output_plugin_private;
+
+	if (data->include_xids)
+		appendStringInfo(ctx->out, "%s\"xid\":%s%u,%s", data->ht, data->sp, txn->xid, data->nl);
+
+	if (data->include_lsn)
+	{
+		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, txn->end_lsn));
+		appendStringInfo(ctx->out, "%s\"nextlsn\":%s\"%s\",%s", data->ht, data->sp, lsn_str, data->nl);
+		pfree(lsn_str);
+	}
+
+	if (data->include_timestamp)
+		appendStringInfo(ctx->out, "%s\"timestamp\":%s\"%s\",%s", data->ht, data->sp, timestamptz_to_str(txn->commit_time), data->nl);
 }
